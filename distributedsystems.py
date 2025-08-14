@@ -36,7 +36,7 @@ def init_db():
                 FOREIGN KEY (node_id) REFERENCES nodes (node_id)
             )
         """)
-        
+
         conn.commit()
 
 init_db()
@@ -44,7 +44,54 @@ init_db()
 def run_command(cmd):
     subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-def auto_reschedule():
+def schedule_pod(pod_id, cpu_req, strategy="best_fit"):
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_id, cpu, status FROM nodes WHERE status = 'healthy'")
+        nodes = cursor.fetchall()
+
+        assigned_node = None
+
+        if strategy == "first_fit":
+            # First node that can fit the pod
+            for node_id, cpu, status in nodes:
+                if cpu >= cpu_req:
+                    assigned_node = node_id
+                    break
+
+        elif strategy == "best_fit":
+    # Node with minimum available CPU that can still handle the request
+            best_node = None
+            min_cpu = float("inf")
+            for node_id, cpu, status in nodes:
+                if cpu >= cpu_req and cpu < min_cpu:
+                    min_cpu = cpu
+                    best_node = node_id
+            assigned_node = best_node
+
+
+        elif strategy == "worst_fit":
+            # Node with most leftover CPU after allocation
+            worst_node = None
+            max_leftover = -1
+            for node_id, cpu, status in nodes:
+                if cpu >= cpu_req and (cpu - cpu_req) > max_leftover:
+                    max_leftover = cpu - cpu_req
+                    worst_node = node_id
+            assigned_node = worst_node
+
+        if assigned_node:
+            cursor.execute("SELECT cpu FROM nodes WHERE node_id = ?", (assigned_node,))
+            available_cpu = cursor.fetchone()[0]
+            new_cpu = available_cpu - cpu_req
+            cursor.execute("UPDATE nodes SET cpu = ? WHERE node_id = ?", (new_cpu, assigned_node))
+            cursor.execute("UPDATE pods SET node_id = ?, status = 'running' WHERE pod_id = ?", (assigned_node, pod_id))
+            conn.commit()
+            return assigned_node
+
+        return None
+
+def auto_reschedule(strategy="best_fit"):
     while True:
         time.sleep(15)
         with sqlite3.connect(db_file) as conn:
@@ -52,24 +99,9 @@ def auto_reschedule():
             cursor.execute("SELECT pod_id, cpu FROM pods WHERE node_id IS NULL")
             failed_pods = cursor.fetchall()
             for pod_id, cpu in failed_pods:
-                assigned_node = schedule_pod(pod_id, cpu)
+                assigned_node = schedule_pod(pod_id, cpu, strategy)
                 if assigned_node:
-                    logging.info(f"Rescheduled pod {pod_id} to Node {assigned_node}")
-
-def schedule_pod(pod_id, cpu_req):
-    with sqlite3.connect(db_file) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT node_id, cpu, status FROM nodes WHERE status = 'healthy' ORDER BY cpu DESC")
-        nodes = cursor.fetchall()
-        
-        for node_id, cpu, status in nodes:
-            if cpu >= cpu_req:
-                new_cpu = cpu - cpu_req
-                cursor.execute("UPDATE nodes SET cpu = ?, status = ? WHERE node_id = ?", (new_cpu, status, node_id))
-                cursor.execute("UPDATE pods SET node_id = ?, status = 'running' WHERE pod_id = ?", (node_id, pod_id))
-                conn.commit()
-                return node_id
-        return None
+                    logging.info(f"Rescheduled pod {pod_id} to Node {assigned_node} using {strategy}")
 
 @app.route('/add_node', methods=['POST'])
 def add_node():
@@ -86,6 +118,7 @@ def launch_pod():
     data = request.json
     pod_id = data['pod_id']
     cpu_req = data['cpu']
+    strategy = data.get('strategy', 'best_fit')  # default
 
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
@@ -108,11 +141,11 @@ def launch_pod():
         """, (pod_id, cpu_req))
         conn.commit()
 
-    assigned_node = schedule_pod(pod_id, cpu_req)
+    assigned_node = schedule_pod(pod_id, cpu_req, strategy)
     if assigned_node:
-        return jsonify({'message': f'Pod {pod_id} launched on Node {assigned_node}'})
+        return jsonify({'message': f'Pod {pod_id} launched on Node {assigned_node} using {strategy}'})
     else:
-        return jsonify({'error': 'No single node has enough resources right now, retrying in next cycle'}), 400
+        return jsonify({'error': f'No single node has enough resources right now with {strategy}'}), 400
 
 @app.route('/heartbeat', methods=['POST'])
 def heartbeat():
@@ -187,7 +220,7 @@ def auto_heartbeat():
 # Start background threads
 threading.Thread(target=heartbeat_checker, daemon=True).start()
 threading.Thread(target=auto_heartbeat, daemon=True).start()
-threading.Thread(target=auto_reschedule, daemon=True).start()
+threading.Thread(target=auto_reschedule, kwargs={'strategy': 'best_fit'}, daemon=True).start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)

@@ -65,6 +65,19 @@ Launch node with CLI.PY :-  python3 cli.py --launch-pod pod1 2
 Launch Pod with curl:- curl -X POST http://127.0.0.1:5001/launch_pod -H "Content-Type: application/json" -d '{"pod_id": "pod2", "cpu": 1}'
 
 
+Launch Pods With Scheduling Algorithms
+
+curl -X POST http://localhost:5001/launch_pod \
+-H "Content-Type: application/json" \
+-d '{"pod_id": "pod1", "cpu": 3, "strategy": "first_fit"}'
+
+curl -X POST http://localhost:5001/launch_pod \
+-H "Content-Type: application/json" \
+-d '{"pod_id": "pod2", "cpu": 3, "strategy": "best_fit"}'
+
+curl -X POST http://localhost:5001/launch_pod \
+-H "Content-Type: application/json" \
+-d '{"pod_id": "pod5", "cpu": 3, "strategy": "worst_fit"}'
 
 
 List Pods
