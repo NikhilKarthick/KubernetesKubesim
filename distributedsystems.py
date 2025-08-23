@@ -11,9 +11,9 @@ logging.basicConfig(level=logging.INFO)
 db_file = "cluster.db"
 lock = threading.Lock()
 
-# Initialize Database and cleanup on restart
+# ---------------- Database Init ----------------
 def init_db():
-    with sqlite3.connect(db_file) as conn:
+    with sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
 
         cursor.execute("DROP TABLE IF EXISTS nodes")
@@ -37,15 +37,32 @@ def init_db():
             )
         """)
 
+        cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )''')
+
+        # Ensure a default strategy exists
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('strategy', 'best_fit')")
         conn.commit()
 
 init_db()
 
+# ---------------- Strategy Helper ----------------
+def get_current_strategy():
+    with sqlite3.connect(db_file, check_same_thread=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key='strategy'")
+        row = cursor.fetchone()
+        return row[0] if row else "best_fit"
+
+# ---------------- Scheduling ----------------
 def run_command(cmd):
     subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-def schedule_pod(pod_id, cpu_req, strategy="best_fit"):
-    with sqlite3.connect(db_file) as conn:
+def schedule_pod(pod_id, cpu_req):
+    strategy = get_current_strategy()
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT node_id, cpu, status FROM nodes WHERE status = 'healthy'")
         nodes = cursor.fetchall()
@@ -53,14 +70,12 @@ def schedule_pod(pod_id, cpu_req, strategy="best_fit"):
         assigned_node = None
 
         if strategy == "first_fit":
-            # First node that can fit the pod
             for node_id, cpu, status in nodes:
                 if cpu >= cpu_req:
                     assigned_node = node_id
                     break
 
         elif strategy == "best_fit":
-    # Node with minimum available CPU that can still handle the request
             best_node = None
             min_cpu = float("inf")
             for node_id, cpu, status in nodes:
@@ -69,9 +84,7 @@ def schedule_pod(pod_id, cpu_req, strategy="best_fit"):
                     best_node = node_id
             assigned_node = best_node
 
-
         elif strategy == "worst_fit":
-            # Node with most leftover CPU after allocation
             worst_node = None
             max_leftover = -1
             for node_id, cpu, status in nodes:
@@ -87,124 +100,191 @@ def schedule_pod(pod_id, cpu_req, strategy="best_fit"):
             cursor.execute("UPDATE nodes SET cpu = ? WHERE node_id = ?", (new_cpu, assigned_node))
             cursor.execute("UPDATE pods SET node_id = ?, status = 'running' WHERE pod_id = ?", (assigned_node, pod_id))
             conn.commit()
+            logging.info(f"Pod {pod_id} scheduled on Node {assigned_node} with {strategy}")
             return assigned_node
 
         return None
 
-def auto_reschedule(strategy="best_fit"):
+def auto_reschedule():
     while True:
         time.sleep(15)
-        with sqlite3.connect(db_file) as conn:
+        strategy = get_current_strategy()
+        with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT pod_id, cpu FROM pods WHERE node_id IS NULL")
             failed_pods = cursor.fetchall()
             for pod_id, cpu in failed_pods:
-                assigned_node = schedule_pod(pod_id, cpu, strategy)
+                assigned_node = schedule_pod(pod_id, cpu)
                 if assigned_node:
-                    logging.info(f"Rescheduled pod {pod_id} to Node {assigned_node} using {strategy}")
+                    logging.info(f"[AUTO] Rescheduled pod {pod_id} to Node {assigned_node} using {strategy}")
 
+# ---------------- API Endpoints ----------------
 @app.route('/add_node', methods=['POST'])
 def add_node():
     data = request.json
     node_id, cpu = data['node_id'], data['cpu']
-    with sqlite3.connect(db_file) as conn:
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT INTO nodes VALUES (?, ?, ?, 'healthy')", (node_id, cpu, time.time()))
         conn.commit()
     return jsonify({'message': f'Node {node_id} added'})
+
+@app.route('/scale', methods=['POST'])
+def scale():
+    count = int(request.args.get("count", 1))
+    responses = []
+    for i in range(count):
+        node_id = f"node_auto_{int(time.time())}_{i}"
+        cpu = 10  # default CPU per node
+        with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO nodes VALUES (?, ?, ?, 'healthy')", (node_id, cpu, time.time()))
+            conn.commit()
+        responses.append(node_id)
+    return jsonify({'message': f'Scaled up by {count} nodes', 'nodes': responses})
 
 @app.route('/launch_pod', methods=['POST'])
 def launch_pod():
     data = request.json
     pod_id = data['pod_id']
     cpu_req = data['cpu']
-    strategy = data.get('strategy', 'best_fit')  # default
 
-    with sqlite3.connect(db_file) as conn:
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM pods WHERE pod_id = ?", (pod_id,))
         if cursor.fetchone():
             return jsonify({'error': f'Pod {pod_id} already exists'}), 400
 
         current_time = time.time()
-        cursor.execute("""
-            SELECT SUM(cpu) FROM nodes WHERE ? - last_heartbeat <= 30
-        """, (current_time,))
+        cursor.execute("SELECT SUM(cpu) FROM nodes WHERE ? - last_heartbeat <= 30", (current_time,))
         total_available_cpu = cursor.fetchone()[0] or 0
 
         if total_available_cpu < cpu_req:
-            return jsonify({'error': 'Insufficient cluster-wide resources to schedule pod'}), 400
+            return jsonify({'error': 'Insufficient cluster-wide resources'}), 400
 
-        cursor.execute("""
-            INSERT INTO pods (pod_id, cpu, node_id, status)
-            VALUES (?, ?, NULL, 'pending')
-        """, (pod_id, cpu_req))
+        cursor.execute("INSERT INTO pods (pod_id, cpu, node_id, status) VALUES (?, ?, NULL, 'pending')",
+                       (pod_id, cpu_req))
         conn.commit()
 
-    assigned_node = schedule_pod(pod_id, cpu_req, strategy)
+    assigned_node = schedule_pod(pod_id, cpu_req)
     if assigned_node:
-        return jsonify({'message': f'Pod {pod_id} launched on Node {assigned_node} using {strategy}'})
+        return jsonify({'message': f'Pod {pod_id} launched on Node {assigned_node} using {get_current_strategy()}'})
     else:
-        return jsonify({'error': f'No single node has enough resources right now with {strategy}'}), 400
+        return jsonify({'error': 'No node can handle pod'}), 400
 
-@app.route('/heartbeat', methods=['POST'])
-def heartbeat():
-    data = request.json
-    node_id = data['node_id']
+@app.route('/leader', methods=['GET'])
+def leader():
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT node_id FROM nodes WHERE status='healthy' ORDER BY node_id ASC LIMIT 1")
+        row = cursor.fetchone()
+    return jsonify({'leader': row[0] if row else None})
+
+@app.route('/set_strategy', methods=['POST'])
+def set_strategy():
+    strategy = request.json.get("strategy", "best_fit")
     with sqlite3.connect(db_file) as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE nodes SET last_heartbeat = ?, status = 'healthy' WHERE node_id = ?", (time.time(), node_id))
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ("strategy", strategy)
+        )
         conn.commit()
-    return jsonify({'message': 'Heartbeat received'})
+    return jsonify({'message': f'Strategy set to {strategy}'})
+
+@app.route("/get_strategy", methods=["GET"])
+def get_strategy():
+    return jsonify({"strategy": get_current_strategy()})
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*), SUM(cpu) FROM nodes WHERE status='healthy'")
+        node_count, total_cpu = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM pods WHERE status='running'")
+        running_pods = cursor.fetchone()[0]
+    return jsonify({
+        'healthy_nodes': node_count or 0,
+        'total_cpu': total_cpu or 0,
+        'running_pods': running_pods
+    })
 
 @app.route('/list_nodes', methods=['GET'])
 def list_nodes():
-    with sqlite3.connect(db_file) as conn:
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT node_id, cpu, last_heartbeat, status FROM nodes")
         node_list = cursor.fetchall()
-    return jsonify([{ 'node_id': node_id, 'cpu': cpu, 'last_heartbeat': last_heartbeat, 'status': status} for node_id, cpu, last_heartbeat, status in node_list])
+    return jsonify([{ 'node_id': node_id, 'cpu': cpu, 'last_heartbeat': last_heartbeat, 'status': status} 
+                    for node_id, cpu, last_heartbeat, status in node_list])
 
 @app.route('/pod_usage', methods=['GET'])
 def pod_usage():
-    with sqlite3.connect(db_file) as conn:
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT pod_id, cpu, node_id, status FROM pods")
         pod_list = cursor.fetchall()
-    return jsonify([{ 'pod_id': pod_id, 'cpu': cpu, 'node_id': node_id, 'status': status} for pod_id, cpu, node_id, status in pod_list])
+    return jsonify([{ 'pod_id': pod_id, 'cpu': cpu, 'node_id': node_id, 'status': status} 
+                    for pod_id, cpu, node_id, status in pod_list])
 
 @app.route('/fail_node', methods=['POST'])
 def fail_node():
     data = request.json
     node_id = data['node_id']
-    with sqlite3.connect(db_file) as conn:
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE nodes SET status = 'unhealthy' WHERE node_id = ?", (node_id,))
         cursor.execute("UPDATE pods SET node_id = NULL, status = 'pending' WHERE node_id = ?", (node_id,))
         conn.commit()
-    logging.warning(f"Node {node_id} has been manually marked as failed.")
-    return jsonify({'message': f'Node {node_id} marked as failed'})
+    logging.warning(f"Node {node_id} marked failed; pods evicted")
+    return jsonify({'message': f'Node {node_id} failed'})
 
 @app.route('/recover_node', methods=['POST'])
 def recover_node():
     data = request.json
     node_id = data['node_id']
-    with sqlite3.connect(db_file) as conn:
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
-        cursor.execute("UPDATE nodes SET status = 'healthy', last_heartbeat = ? WHERE node_id = ?", (time.time(), node_id))
+        cursor.execute("UPDATE nodes SET status = 'healthy', last_heartbeat = ? WHERE node_id = ?",
+                       (time.time(), node_id))
         conn.commit()
-    logging.info(f"Node {node_id} has been manually recovered.")
-    return jsonify({'message': f'Node {node_id} marked as healthy'})
+    logging.info(f"Node {node_id} recovered")
+    return jsonify({'message': f'Node {node_id} healthy again'})
 
+@app.route("/heartbeat", methods=["POST"])
+def heartbeat():
+    data = request.get_json()
+    node = data.get("node_id")
+
+    if not node:
+        return jsonify({"error": "Missing node field"}), 400
+
+    with lock, sqlite3.connect(db_file) as conn:
+        conn.execute(
+            "UPDATE nodes SET last_heartbeat = ? WHERE node_id = ?",
+            (int(time.time()), node)
+        )
+        conn.commit()
+
+    return jsonify({"message": f"Heartbeat received from {node}"}), 200
+
+# ---------------- Background Threads ----------------
 def heartbeat_checker():
     while True:
         time.sleep(10)
-        with sqlite3.connect(db_file) as conn:
+        with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT node_id FROM nodes WHERE ? - last_heartbeat > 30", (time.time(),))
             failed_nodes = cursor.fetchall()
             for (node_id,) in failed_nodes:
-                logging.warning(f"Node {node_id} failed!")
+                logging.warning(f"Node {node_id} failed (timeout)!")
                 cursor.execute("UPDATE nodes SET status = 'unhealthy' WHERE node_id = ?", (node_id,))
                 cursor.execute("UPDATE pods SET node_id = NULL, status = 'pending' WHERE node_id = ?", (node_id,))
             conn.commit()
@@ -212,15 +292,14 @@ def heartbeat_checker():
 def auto_heartbeat():
     while True:
         time.sleep(5)
-        with sqlite3.connect(db_file) as conn:
+        with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE nodes SET last_heartbeat = ?", (time.time(),))
             conn.commit()
 
-# Start background threads
 threading.Thread(target=heartbeat_checker, daemon=True).start()
 threading.Thread(target=auto_heartbeat, daemon=True).start()
-threading.Thread(target=auto_reschedule, kwargs={'strategy': 'best_fit'}, daemon=True).start()
+threading.Thread(target=auto_reschedule, daemon=True).start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5001, debug=True)

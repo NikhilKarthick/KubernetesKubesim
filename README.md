@@ -93,6 +93,40 @@ python3 cli.py --fail-node node1
 # Recover failed node
 python3 cli.py --recover-node node1
 
+# Delete Node
+
+curl -X DELETE http://localhost:5001/remove_node/node1
+
+# Set Scheduling 
+curl -X POST http://localhost:5001/set_strategy -H "Content-Type: application/json" -d '{"strategy":"first_fit"}'
+curl -X POST http://localhost:5001/set_strategy -H "Content-Type: application/json" -d '{"strategy":"best_fit"}'
+curl -X POST http://localhost:5001/set_strategy -H "Content-Type: application/json" -d '{"strategy":"worst_fit"}'
+
+# Get current scheduling policy 
+
+curl http://localhost:5001/get_strategy
+
+# Simulate a node heartbeat
+
+curl -X POST http://localhost:5001/heartbeat -H "Content-Type: application/json" \
+  -d '{"node": "node1"}'
+
+# Show the leader
+
+curl http://localhost:5001/leader
+
+# Scaling
+
+curl -X POST "http://localhost:5001/scale?count=10"
+curl -X POST "http://localhost:5001/scale?count=100"
+curl -X POST "http://localhost:5001/scale?count=1000"
+
+
+
+
+
+
+
 
 
 
