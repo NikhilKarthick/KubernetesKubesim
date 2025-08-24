@@ -9,7 +9,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 db_file = "cluster.db"
-lock = threading.Lock()
+lock = threading.RLock()
 
 # ---------------- Database Init ----------------
 def init_db():
@@ -37,6 +37,7 @@ def init_db():
             )
         """)
 
+        cursor.execute("DROP TABLE IF EXISTS settings")
         cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -44,6 +45,8 @@ def init_db():
 
         # Ensure a default strategy exists
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('strategy', 'best_fit')")
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('leader', 'none')")
+
         conn.commit()
 
 init_db()
@@ -176,9 +179,36 @@ def launch_pod():
 def leader():
     with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
         cursor = conn.cursor()
+
+        # Fetch current leader from settings
+        cursor.execute("SELECT value FROM settings WHERE key='leader'")
+        row = cursor.fetchone()
+        current_leader = row[0] if row else "none"
+
+        if current_leader:
+            # Check if current leader is still healthy
+            cursor.execute("SELECT 1 FROM nodes WHERE node_id=? AND status='healthy'", (current_leader,))
+            if cursor.fetchone():
+                # Leader is still alive → stick with it
+                return jsonify({'leader': current_leader})
+
+        # No leader, or current leader failed → elect new one
         cursor.execute("SELECT node_id FROM nodes WHERE status='healthy' ORDER BY node_id ASC LIMIT 1")
         row = cursor.fetchone()
-    return jsonify({'leader': row[0] if row else None})
+        new_leader = row[0] if row else "none"
+
+        if new_leader:
+            # Save the new leader back to settings
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                ("leader", new_leader)
+            )
+            conn.commit()
+
+    return jsonify({'leader': new_leader})
+
+   
+
 
 @app.route('/set_strategy', methods=['POST'])
 def set_strategy():
@@ -233,6 +263,24 @@ def pod_usage():
         pod_list = cursor.fetchall()
     return jsonify([{ 'pod_id': pod_id, 'cpu': cpu, 'node_id': node_id, 'status': status} 
                     for pod_id, cpu, node_id, status in pod_list])
+
+@app.route('/remove_node/<node_id>', methods=['DELETE'])
+def remove_node(node_id):
+    with lock, sqlite3.connect(db_file, check_same_thread=False) as conn:
+        cursor = conn.cursor()
+        # Check if node exists
+        cursor.execute("SELECT * FROM nodes WHERE node_id=?", (node_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            return jsonify({"error": f"Node {node_id} not found"}), 404
+
+        # Delete the node
+        cursor.execute("DELETE FROM nodes WHERE node_id=?", (node_id,))
+        conn.commit()
+
+    return jsonify({"message": f"Node {node_id} removed successfully"})
+
 
 @app.route('/fail_node', methods=['POST'])
 def fail_node():

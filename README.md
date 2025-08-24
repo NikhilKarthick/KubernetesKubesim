@@ -6,10 +6,10 @@ Build the image
 docker build -t distributed-system-sim .
 
 Run the container
-docker run -d -p 5001:5001 --name ds-cluster distributed-system-sim
+docker run -d -p 5000:5001 --name ds-cluster distributed-system-sim
 
 Run Command
-docker run -it --rm -p 5001:5001 distributed-system-sim
+docker run -it --rm -p 5000:5001 distributed-system-sim
 
 
 
@@ -22,14 +22,14 @@ docker run -d -p 5001:5001 --name ds-cluster distributed-system-sim
 Volume Binding
 -v $(pwd)/cluster.db:/app/cluster.db
 
-docker run -d -p 5001:5001 -v $(pwd)/cluster.db:/app/cluster.db --name ds-cluster distributed-system-sim
+docker run -d -p 5000:5001 -v $(pwd)/cluster.db:/app/cluster.db --name ds-cluster distributed-system-sim
 
 
 
 # KubernetesKubesim
 Run The Main File :- python3 distributedsystems.py 
 
-List Nodes 
+# List Nodes 
 
 
 
@@ -39,7 +39,7 @@ List nodes with curl :- curl -X GET http://127.0.0.1:5001/list_nodes
 
 
 
-Add Nodes
+# add Nodes
 
 
 
@@ -48,7 +48,7 @@ Add nodes with curl:- curl -X POST http://127.0.0.1:5001/add_node -H "Content-Ty
 
 
 
-Send Heartbeat (To Prevent Failure)
+# Send Heartbeat (To Prevent Failure)
 
 Heartbeat with curl:- 
 curl -X POST http://127.0.0.1:5001/heartbeat -H "Content-Type: application/json" -d '{"node_id": "node1"}'
@@ -58,29 +58,13 @@ You can simulate automatic heartbeats externally using a simple watch or loop sc
 while true; do curl -X POST http://127.0.0.1:5001/heartbeat -H "Content-Type: application/json" -d '{"node_id":"node1"}'; sleep 5; done
 
 
-Launch Pods
+# Launch Pods
 
 
 Launch node with CLI.PY :-  python3 cli.py --launch-pod pod1 2
 Launch Pod with curl:- curl -X POST http://127.0.0.1:5001/launch_pod -H "Content-Type: application/json" -d '{"pod_id": "pod2", "cpu": 1}'
 
-
-Launch Pods With Scheduling Algorithms
-
-curl -X POST http://localhost:5001/launch_pod \
--H "Content-Type: application/json" \
--d '{"pod_id": "pod1", "cpu": 3, "strategy": "first_fit"}'
-
-curl -X POST http://localhost:5001/launch_pod \
--H "Content-Type: application/json" \
--d '{"pod_id": "pod2", "cpu": 3, "strategy": "best_fit"}'
-
-curl -X POST http://localhost:5001/launch_pod \
--H "Content-Type: application/json" \
--d '{"pod_id": "pod5", "cpu": 3, "strategy": "worst_fit"}'
-
-
-List Pods
+# List Pods
 
 python3 cli.py --list-pods
 
@@ -120,6 +104,12 @@ curl http://localhost:5001/leader
 curl -X POST "http://localhost:5001/scale?count=10"
 curl -X POST "http://localhost:5001/scale?count=100"
 curl -X POST "http://localhost:5001/scale?count=1000"
+
+# Metrics
+curl -X GET http://localhost:5001/metrics
+
+
+List nodes with curl :- curl -X GET http://127.0.0.1:5001/list_nodes
 
 
 
